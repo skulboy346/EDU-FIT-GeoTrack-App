@@ -1,0 +1,437 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Play, Pause, Square, MapPin, Navigation, Clock, Activity, RotateCcw, Footprints } from 'lucide-react';
+
+// --- Helper: Load External Scripts (Leaflet) ---
+const useScript = (url) => {
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = url;
+    script.async = true;
+    script.onload = () => setLoaded(true);
+    document.body.appendChild(script);
+    return () => { document.body.removeChild(script); };
+  }, [url]);
+  return loaded;
+};
+
+const useStyle = (url) => {
+  useEffect(() => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = url;
+    document.head.appendChild(link);
+    return () => { document.head.removeChild(link); };
+  }, [url]);
+};
+
+// --- Helper: Haversine Distance Calculation (Meters) ---
+const getDistanceFromLatLonInMeters = (lat1, lon1, lat2, lon2) => {
+  const R = 6371e3; // Radius of the earth in meters
+  const dLat = deg2rad(lat2 - lat1);
+  const dLon = deg2rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+const deg2rad = (deg) => deg * (Math.PI / 180);
+
+// --- Main Component ---
+export default function EDUGeoTrack() {
+  // Load Leaflet resources
+  const leafletScriptLoaded = useScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js');
+  useStyle('https://unpkg.com/leaflet@1.9.4/dist/leaflet.css');
+
+  // State
+  const [isActive, setIsActive] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [path, setPath] = useState([]); // Array of [lat, lng]
+  const [distance, setDistance] = useState(0); // in meters
+  const [elapsedTime, setElapsedTime] = useState(0); // in seconds
+  const [currentSpeed, setCurrentSpeed] = useState(0); // km/h
+  const [demoMode, setDemoMode] = useState(false);
+  const [errorMsg, setErrorMsg] = useState(null);
+
+  // Refs for Map and Instances
+  const mapRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const polylineRef = useRef(null);
+  const markerRef = useRef(null);
+  const watchIdRef = useRef(null);
+  const demoIntervalRef = useRef(null);
+  const startTimeRef = useRef(null);
+
+  // Format Time (HH:MM:SS)
+  const formatTime = (totalSeconds) => {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  };
+
+  // --- Mobile Optimization: Hide Browser UI on "Add to Home Screen" ---
+  useEffect(() => {
+    // 1. Prevent bounce/overscroll on mobile
+    document.body.style.overscrollBehavior = "none";
+    
+    // 2. Add Apple-specific meta tags dynamically for Fullscreen experience
+    const metas = [
+      { name: 'apple-mobile-web-app-capable', content: 'yes' },
+      { name: 'apple-mobile-web-app-status-bar-style', content: 'black-translucent' },
+      { name: 'viewport', content: 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no' }
+    ];
+
+    metas.forEach(tagInfo => {
+      // Check if exists to avoid duplicates
+      if (!document.querySelector(`meta[name="${tagInfo.name}"]`)) {
+        const meta = document.createElement('meta');
+        meta.name = tagInfo.name;
+        meta.content = tagInfo.content;
+        document.head.appendChild(meta);
+      }
+    });
+  }, []);
+
+  // Initialize Map
+  useEffect(() => {
+    if (leafletScriptLoaded && mapRef.current && !mapInstanceRef.current && window.L) {
+      const L = window.L;
+      
+      // Default view (will be updated by location)
+      const map = L.map(mapRef.current, {
+        zoomControl: false // Move zoom control or hide it for mobile look
+      }).setView([0, 0], 2);
+      
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+
+      mapInstanceRef.current = map;
+
+      // Locate user immediately for initial view
+      map.locate({ setView: true, maxZoom: 16 });
+
+      map.on('locationfound', (e) => {
+        if (path.length === 0) {
+          // Set initial marker
+          if (!markerRef.current) {
+            const runnerIcon = L.divIcon({
+              html: `<div style="background-color: #3b82f6; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);"></div>`,
+              className: 'custom-runner-icon',
+              iconSize: [20, 20],
+              iconAnchor: [10, 10]
+            });
+            markerRef.current = L.marker(e.latlng, { icon: runnerIcon }).addTo(map);
+          }
+        }
+      });
+
+      map.on('locationerror', (e) => {
+        setErrorMsg("Could not access location. Please allow permissions.");
+      });
+    }
+  }, [leafletScriptLoaded]);
+
+  // Handle Timer
+  useEffect(() => {
+    let interval = null;
+    if (isActive && !isPaused) {
+      interval = setInterval(() => {
+        setElapsedTime((prev) => prev + 1);
+      }, 1000);
+    } else {
+      clearInterval(interval);
+    }
+    return () => clearInterval(interval);
+  }, [isActive, isPaused]);
+
+  // Handle Real GPS Tracking
+  useEffect(() => {
+    if (isActive && !isPaused && !demoMode && navigator.geolocation) {
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (position) => {
+          const { latitude, longitude, speed } = position.coords;
+          const newPoint = [latitude, longitude];
+          updatePath(newPoint, speed);
+        },
+        (error) => setErrorMsg(error.message),
+        { enableHighAccuracy: true, distanceFilter: 5 }
+      );
+    } else {
+      if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current);
+    }
+    return () => {
+      if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current);
+    };
+  }, [isActive, isPaused, demoMode]);
+
+  // Handle Demo Mode (Simulation)
+  useEffect(() => {
+    if (isActive && !isPaused && demoMode && mapInstanceRef.current) {
+      const center = mapInstanceRef.current.getCenter();
+      let lat = path.length > 0 ? path[path.length - 1][0] : center.lat;
+      let lng = path.length > 0 ? path[path.length - 1][1] : center.lng;
+      let angle = 0;
+
+      demoIntervalRef.current = setInterval(() => {
+        // Simulate a person running in a messy circle
+        angle += 0.1;
+        lat += (Math.sin(angle) * 0.00015) + (Math.random() * 0.00005);
+        lng += (Math.cos(angle) * 0.00015) + (Math.random() * 0.00005);
+        
+        // Approx 10km/h speed for demo (2.7 m/s)
+        updatePath([lat, lng], 2.7); 
+      }, 1000);
+    } else {
+      clearInterval(demoIntervalRef.current);
+    }
+    return () => clearInterval(demoIntervalRef.current);
+  }, [isActive, isPaused, demoMode]);
+
+  // Core Logic: Update Path and Stats
+  const updatePath = (newPoint, speedMPS) => {
+    setPath((prevPath) => {
+      const updatedPath = [...prevPath, newPoint];
+      
+      // Calculate distance added
+      if (prevPath.length > 0) {
+        const lastPoint = prevPath[prevPath.length - 1];
+        const distAdded = getDistanceFromLatLonInMeters(
+          lastPoint[0], lastPoint[1],
+          newPoint[0], newPoint[1]
+        );
+        setDistance((d) => d + distAdded);
+      }
+
+      // Update Map Visuals
+      if (mapInstanceRef.current && window.L) {
+        const L = window.L;
+        
+        // Update Line
+        if (!polylineRef.current) {
+          polylineRef.current = L.polyline(updatedPath, { color: '#3b82f6', weight: 5 }).addTo(mapInstanceRef.current);
+        } else {
+          polylineRef.current.setLatLngs(updatedPath);
+        }
+
+        // Update Marker Position
+        if (markerRef.current) {
+          markerRef.current.setLatLng(newPoint);
+        } else {
+          // Create marker if it doesn't exist yet
+           const runnerIcon = L.divIcon({
+              html: `<div style="background-color: #3b82f6; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);"></div>`,
+              className: 'custom-runner-icon',
+              iconSize: [20, 20],
+              iconAnchor: [10, 10]
+            });
+           markerRef.current = L.marker(newPoint, { icon: runnerIcon }).addTo(mapInstanceRef.current);
+        }
+
+        // Pan map to follow user
+        mapInstanceRef.current.panTo(newPoint);
+      }
+
+      // Update Speed (convert m/s to km/h)
+      // If speed is null (sometimes on GPS), calculate based on last segment
+      let currentSpeedKmh = 0;
+      if (speedMPS !== null && speedMPS !== undefined) {
+         currentSpeedKmh = speedMPS * 3.6;
+      } 
+      setCurrentSpeed(currentSpeedKmh);
+
+      return updatedPath;
+    });
+  };
+
+  const handleStart = () => {
+    setIsActive(true);
+    setIsPaused(false);
+    
+    // Clear previous if restarting from full stop
+    if (!isPaused && path.length > 0) {
+        // usually we keep the path if just paused, but if fully stopped we might reset.
+        // For this UX, Start implies resuming or starting fresh if reset.
+    }
+  };
+
+  const handlePause = () => {
+    setIsPaused(true);
+  };
+
+  const handleStop = () => {
+    setIsActive(false);
+    setIsPaused(false);
+    // Fit bounds to show the whole run
+    if (mapInstanceRef.current && polylineRef.current && window.L) {
+       const bounds = polylineRef.current.getBounds();
+       if(bounds.isValid()) mapInstanceRef.current.fitBounds(bounds, { padding: [50, 50] });
+    }
+  };
+
+  const handleReset = () => {
+    setIsActive(false);
+    setIsPaused(false);
+    setPath([]);
+    setDistance(0);
+    setElapsedTime(0);
+    setCurrentSpeed(0);
+    
+    // Clear map layers
+    if (polylineRef.current) polylineRef.current.remove();
+    polylineRef.current = null;
+    // We keep the marker at the last known location
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-gray-100 font-sans">
+      {/* Header */}
+      <header className="bg-white shadow-sm p-4 z-10">
+        <div className="flex justify-between items-center max-w-4xl mx-auto">
+          <div className="flex items-center gap-2">
+            <Footprints className="text-blue-600" size={28} />
+            <h1 className="text-2xl font-bold text-gray-800 tracking-tight">EDU-GeoTrack</h1>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-gray-500 uppercase mr-1 hidden sm:inline">Simulation</span>
+            <button 
+              onClick={() => { if(!isActive) setDemoMode(!demoMode) }}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${demoMode ? 'bg-blue-600' : 'bg-gray-200'} ${isActive ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+            >
+              <span className={`${demoMode ? 'translate-x-6' : 'translate-x-1'} inline-block h-4 w-4 transform rounded-full bg-white transition`}/>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <main className="flex-1 relative flex flex-col">
+        
+        {/* Map Container */}
+        <div className="flex-1 relative bg-gray-200">
+           {/* Loading State for Map */}
+           {!leafletScriptLoaded && (
+             <div className="absolute inset-0 flex items-center justify-center bg-gray-100 z-50">
+               <p className="text-gray-500">Loading Map Engine...</p>
+             </div>
+           )}
+           
+           <div ref={mapRef} className="absolute inset-0 z-0" style={{ outline: 'none' }} />
+
+           {/* Error Toast */}
+           {errorMsg && (
+             <div className="absolute top-4 left-4 right-4 z-[400] bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded shadow-lg max-w-md mx-auto flex justify-between items-center">
+               <p>{errorMsg}</p>
+               <button onClick={() => setErrorMsg(null)} className="font-bold">✕</button>
+             </div>
+           )}
+        </div>
+
+        {/* Stats Card - Floating Overlay */}
+        <div className="bg-white border-t border-gray-200 p-4 sm:p-6 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] z-10 rounded-t-3xl sm:rounded-none">
+          <div className="max-w-4xl mx-auto">
+            
+            {/* Stats Grid */}
+            <div className="grid grid-cols-3 gap-2 sm:gap-8 mb-6 text-center">
+              <div className="flex flex-col items-center p-2 bg-blue-50 rounded-xl">
+                <div className="flex items-center gap-1 text-blue-600 mb-1">
+                  <Navigation size={18} />
+                  <span className="text-xs font-bold uppercase tracking-wide">Distance</span>
+                </div>
+                <div className="text-2xl sm:text-3xl font-black text-gray-800">
+                  {(distance / 1000).toFixed(2)} <span className="text-sm sm:text-lg font-medium text-gray-500">km</span>
+                </div>
+              </div>
+
+              <div className="flex flex-col items-center p-2 bg-orange-50 rounded-xl">
+                <div className="flex items-center gap-1 text-orange-600 mb-1">
+                  <Clock size={18} />
+                  <span className="text-xs font-bold uppercase tracking-wide">Time</span>
+                </div>
+                <div className="text-2xl sm:text-3xl font-black text-gray-800 font-mono">
+                  {formatTime(elapsedTime)}
+                </div>
+              </div>
+
+              <div className="flex flex-col items-center p-2 bg-green-50 rounded-xl">
+                <div className="flex items-center gap-1 text-green-600 mb-1">
+                  <Activity size={18} />
+                  <span className="text-xs font-bold uppercase tracking-wide">Pace</span>
+                </div>
+                <div className="text-2xl sm:text-3xl font-black text-gray-800">
+                  {currentSpeed.toFixed(1)} <span className="text-sm sm:text-lg font-medium text-gray-500">km/h</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Controls */}
+            <div className="flex items-center justify-center gap-4 sm:gap-6">
+              {!isActive ? (
+                <button 
+                  onClick={handleStart}
+                  className="w-full sm:w-auto px-8 py-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-2xl flex items-center justify-center gap-3 font-bold text-lg shadow-lg shadow-blue-200 transition-all transform hover:scale-105"
+                >
+                  <Play fill="currentColor" /> Start Run
+                </button>
+              ) : (
+                <>
+                  {!isPaused ? (
+                    <button 
+                      onClick={handlePause}
+                      className="flex-1 sm:flex-none px-8 py-4 bg-yellow-500 hover:bg-yellow-600 text-white rounded-2xl flex items-center justify-center gap-2 font-bold text-lg shadow-lg shadow-yellow-200 transition-all"
+                    >
+                      <Pause fill="currentColor" /> Pause
+                    </button>
+                  ) : (
+                    <button 
+                      onClick={handleStart}
+                      className="flex-1 sm:flex-none px-8 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl flex items-center justify-center gap-2 font-bold text-lg shadow-lg shadow-blue-200 transition-all"
+                    >
+                      <Play fill="currentColor" /> Resume
+                    </button>
+                  )}
+
+                  <button 
+                    onClick={handleStop}
+                    className="flex-1 sm:flex-none px-8 py-4 bg-red-500 hover:bg-red-600 text-white rounded-2xl flex items-center justify-center gap-2 font-bold text-lg shadow-lg shadow-red-200 transition-all"
+                  >
+                    <Square fill="currentColor" size={18} /> Stop
+                  </button>
+                </>
+              )}
+
+              {/* Reset Button (Only visible if stopped and data exists) */}
+              {!isActive && distance > 0 && (
+                <button 
+                  onClick={handleReset}
+                  className="px-4 py-4 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-2xl flex items-center justify-center transition-colors"
+                  title="Reset Run"
+                >
+                  <RotateCcw size={20} />
+                </button>
+              )}
+            </div>
+            
+            {demoMode && (
+              <p className="text-center text-xs text-gray-400 mt-4">
+                *Demo Mode Active: GPS movement is being simulated.
+              </p>
+            )}
+
+            {/* Branding Footer */}
+            <div className="mt-6 text-center border-t border-gray-100 pt-4">
+              <p className="text-[10px] font-bold text-blue-900/40 tracking-widest uppercase">
+                Powered by "The AMBASSADOR'S SPORTS"
+              </p>
+            </div>
+
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
