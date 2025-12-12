@@ -32,8 +32,11 @@
         .leaflet-control-attribution { font-size: 8px; background: rgba(255,255,255,0.7); padding: 0 4px; border-radius: 4px; }
         .leaflet-control-layers { border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); border: none; font-family: sans-serif; font-weight: 600; }
         .leaflet-touch .leaflet-control-layers-toggle { width: 44px; height: 44px; }
-        .leaflet-popup-content-wrapper { border-radius: 12px; font-family: sans-serif; font-size: 12px; }
-        .leaflet-popup-content { margin: 10px; text-align: center; }
+        .leaflet-control-zoom { border: none !important; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1) !important; }
+        .leaflet-control-zoom a { border-radius: 8px !important; width: 40px !important; height: 40px !important; line-height: 40px !important; font-size: 18px !important; color: #333 !important; margin-bottom: 5px !important; background: white !important; }
+        
+        .leaflet-popup-content-wrapper { border-radius: 12px; font-family: sans-serif; font-size: 12px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }
+        .leaflet-popup-content { margin: 12px; text-align: center; line-height: 1.4; }
         
         /* Pulse Animation for Heart */
         @keyframes heartbeat {
@@ -109,7 +112,7 @@
             const [distance, setDistance] = useState(0);
             const [elapsedTime, setElapsedTime] = useState(0);
             const [currentSpeed, setCurrentSpeed] = useState(0);
-            const [heartRate, setHeartRate] = useState(72); // Default BPM
+            const [heartRate, setHeartRate] = useState(72);
             const [demoMode, setDemoMode] = useState(false);
             const [errorMsg, setErrorMsg] = useState(null);
 
@@ -119,7 +122,8 @@
 
             const mapRef = useRef(null);
             const mapInstanceRef = useRef(null);
-            const polylineRef = useRef(null);
+            const polylineRef = useRef(null); // The glow
+            const polylineInnerRef = useRef(null); // The sharp line
             const markerRef = useRef(null);
             const watchIdRef = useRef(null);
             const demoIntervalRef = useRef(null);
@@ -132,12 +136,36 @@
                 return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
             };
 
-            // Helper to smart format distance (m if < 1000, km if >= 1000)
             const formatDistance = (meters) => {
                 if (meters < 1000) {
                     return { value: Math.round(meters), unit: 'm' };
                 }
                 return { value: (meters / 1000).toFixed(2), unit: 'km' };
+            };
+
+            // Reverse Geocoding Function (Get Street Name)
+            const getStreetName = async (lat, lng) => {
+                try {
+                    // Using OSM Nominatim - strictly limited use, good for demos/low volume.
+                    // User-Agent is good practice.
+                    const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
+                    const response = await fetch(url, {
+                        headers: { 'User-Agent': 'EDU-GeoTrack-App' }
+                    });
+                    const data = await response.json();
+                    
+                    // Construct a nice address
+                    if (data && data.address) {
+                        const road = data.address.road || data.address.pedestrian || data.address.suburb || "";
+                        const area = data.address.city || data.address.town || data.address.county || "";
+                        if (road) return `${road}, ${area}`;
+                        if (data.display_name) return data.display_name.split(',')[0];
+                    }
+                    return "Unknown Location";
+                } catch (e) {
+                    console.error("Geocoding error", e);
+                    return "Location Unavailable";
+                }
             };
 
             // Load History on Mount
@@ -149,7 +177,6 @@
                 if (savedVitals) setVitals(JSON.parse(savedVitals));
             }, []);
 
-            // Save Vitals
             const saveVitals = () => {
                 localStorage.setItem('eduGeoTrack_vitals', JSON.stringify(vitals));
                 alert("Health vitals saved!");
@@ -157,10 +184,15 @@
 
             // Map Initialization
             useEffect(() => {
-                // Only initialize map if we are on the tracker tab and container exists
                 if (activeTab === 'tracker' && !mapInstanceRef.current && document.getElementById('map-container')) {
-                    const map = L.map('map-container', { zoomControl: false }).setView(UNILAG_COORDS, 16);
+                    // Initialize map with zoom controls ENABLED now
+                    const map = L.map('map-container', { 
+                        zoomControl: false // We will add it manually to position it better
+                    }).setView(UNILAG_COORDS, 16);
                     
+                    // Add Zoom Control to Bottom Right
+                    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
                     const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                         attribution: '&copy; OSM',
                         maxZoom: 19
@@ -181,12 +213,14 @@
 
                     mapInstanceRef.current = map;
                     
-                    // If we have a path, redraw it (useful when switching tabs)
                     if (path.length > 0) {
-                         polylineRef.current = L.polyline(path, { color: '#F97316', weight: 6, opacity: 0.9 }).addTo(map);
+                         // Re-draw path if returning from another tab
+                         polylineRef.current = L.polyline(path, { color: '#F97316', weight: 8, opacity: 0.4 }).addTo(map); // Glow
+                         polylineInnerRef.current = L.polyline(path, { color: '#FFFFFF', weight: 3, opacity: 1 }).addTo(map); // Sharp inner
+                         
                          const lastPoint = path[path.length - 1];
                          const runnerIcon = L.divIcon({
-                            html: `<div style="background-color: #F97316; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.5);"></div>`,
+                            html: `<div style="background-color: #F97316; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 15px #F97316;"></div>`,
                             className: 'custom-runner-icon',
                             iconSize: [20, 20],
                             iconAnchor: [10, 10]
@@ -200,7 +234,7 @@
                     map.on('locationfound', (e) => {
                         if (path.length === 0 && !markerRef.current) {
                             const runnerIcon = L.divIcon({
-                                html: `<div style="background-color: #f97316; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.5);"></div>`,
+                                html: `<div style="background-color: #f97316; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 15px #F97316;"></div>`,
                                 className: 'custom-runner-icon',
                                 iconSize: [20, 20],
                                 iconAnchor: [10, 10]
@@ -209,32 +243,25 @@
                         }
                     });
                 }
-            }, [activeTab]); // Re-run when tab changes to tracker
+            }, [activeTab]);
 
-            // Timer & Heart Rate Simulator
+            // Timer & Heart Rate
             useEffect(() => {
                 let interval = null;
                 if (isActive && !isPaused) {
                     interval = setInterval(() => {
                         setElapsedTime(p => p + 1);
-                        
-                        // Simulate Heart Rate Fluctuation
-                        // Base: 80, rises with speed/activity. Range 110-150 when running
                         const randomFluctuation = Math.floor(Math.random() * 5) - 2; 
                         setHeartRate(prev => {
                             let target = 135; 
-                            if (currentSpeed < 2) target = 100; // walking/slow
-                            if (currentSpeed > 10) target = 160; // running fast
-                            
-                            // Move towards target slowly
+                            if (currentSpeed < 2) target = 100;
+                            if (currentSpeed > 10) target = 160;
                             const diff = target - prev;
                             return prev + (diff * 0.1) + randomFluctuation;
                         });
-
                     }, 1000);
                 } else {
                     clearInterval(interval);
-                    // Drop HR when paused
                     if(isPaused && heartRate > 80) {
                          const dropInterval = setInterval(() => {
                              setHeartRate(h => Math.max(75, h - 1));
@@ -245,12 +272,15 @@
                 return () => clearInterval(interval);
             }, [isActive, isPaused, currentSpeed]);
 
-            // GPS Logic
+            // GPS Logic with ACCURACY FILTER
             useEffect(() => {
                 if (isActive && !isPaused && !demoMode && navigator.geolocation) {
                     watchIdRef.current = navigator.geolocation.watchPosition(
                         (position) => {
-                            const { latitude, longitude, speed } = position.coords;
+                            const { latitude, longitude, speed, accuracy } = position.coords;
+                            // Filter: If accuracy is very bad (>50m), ignore it to avoid spikes
+                            if (accuracy && accuracy > 50) return;
+                            
                             updatePath([latitude, longitude], speed);
                         },
                         (err) => setErrorMsg(err.message),
@@ -265,7 +295,6 @@
             // Demo Mode
             useEffect(() => {
                 if (isActive && !isPaused && demoMode && activeTab === 'tracker') {
-                    // Ensure map instance exists before trying to access it
                     if (!mapInstanceRef.current) return;
 
                     let lat = path.length > 0 ? path[path.length - 1][0] : UNILAG_COORDS[0];
@@ -279,6 +308,7 @@
 
                     demoIntervalRef.current = setInterval(() => {
                         angle += 0.08;
+                        // Smoothing the curve slightly for visual appeal
                         lat += (Math.sin(angle) * 0.00015) + (Math.random() * 0.00002);
                         lng += (Math.cos(angle) * 0.00015) + (Math.random() * 0.00002);
                         updatePath([lat, lng], 3.2); 
@@ -299,17 +329,26 @@
                     }
 
                     if (mapInstanceRef.current) {
+                        // Drawing Smart Realistic Lines (Glow Effect)
+                        // Layer 1: The Glow
                         if (!polylineRef.current) {
-                            polylineRef.current = L.polyline(updatedPath, { color: '#F97316', weight: 6, opacity: 0.9 }).addTo(mapInstanceRef.current);
+                            polylineRef.current = L.polyline(updatedPath, { color: '#F97316', weight: 8, opacity: 0.4, lineCap: 'round' }).addTo(mapInstanceRef.current);
                         } else {
                             polylineRef.current.setLatLngs(updatedPath);
+                        }
+
+                        // Layer 2: The Core Line (Sharp)
+                        if (!polylineInnerRef.current) {
+                            polylineInnerRef.current = L.polyline(updatedPath, { color: '#FFFFFF', weight: 3, opacity: 1, lineCap: 'round' }).addTo(mapInstanceRef.current);
+                        } else {
+                            polylineInnerRef.current.setLatLngs(updatedPath);
                         }
 
                         if (markerRef.current) {
                             markerRef.current.setLatLng(newPoint);
                         } else {
                             const runnerIcon = L.divIcon({
-                                html: `<div style="background-color: #F97316; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.5);"></div>`,
+                                html: `<div style="background-color: #F97316; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 15px #F97316;"></div>`,
                                 className: 'custom-runner-icon',
                                 iconSize: [20, 20],
                                 iconAnchor: [10, 10]
@@ -330,12 +369,14 @@
 
             const handleStart = () => { setIsActive(true); setIsPaused(false); };
             
-            const handlePause = () => {
+            // --- NEW: Handle Pause with Geocoding ---
+            const handlePause = async () => {
                 setIsPaused(true);
                 if (path.length > 0 && mapInstanceRef.current) {
                     const lastPoint = path[path.length - 1];
                     const distDisplay = formatDistance(distance);
-
+                    
+                    // Create marker first
                     const pauseMarker = L.marker(lastPoint, {
                         icon: L.divIcon({
                             html: `<div style="background-color: #eab308; color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 900; border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.4);">||</div>`,
@@ -344,15 +385,29 @@
                             iconAnchor: [12, 12]
                         })
                     }).addTo(mapInstanceRef.current);
-                    
+
+                    // Show temporary loading state
                     pauseMarker.bindPopup(`
                         <div style="text-align:center;">
                             <strong style="color:#eab308; text-transform:uppercase;">Paused</strong><br/>
-                            <span style="font-size:14px; font-weight:bold;">${distDisplay.value} ${distDisplay.unit}</span><br/>
-                            <span style="color:#666;">${formatTime(elapsedTime)}</span>
+                            <span class="text-xs text-gray-400">Locating street...</span><br/>
+                            <span style="font-size:14px; font-weight:bold;">${distDisplay.value} ${distDisplay.unit}</span>
                         </div>
                     `).openPopup();
                     pauseMarkersRef.current.push(pauseMarker);
+
+                    // Fetch Street Name (Async)
+                    const streetName = await getStreetName(lastPoint[0], lastPoint[1]);
+                    
+                    // Update Popup with real street name
+                    pauseMarker.setPopupContent(`
+                        <div style="text-align:center;">
+                            <strong style="color:#eab308; text-transform:uppercase;">Paused</strong><br/>
+                            <span style="font-size:11px; color:#374151; font-weight:600; display:block; margin:4px 0;">📍 ${streetName}</span>
+                            <span style="font-size:14px; font-weight:bold;">${distDisplay.value} ${distDisplay.unit}</span><br/>
+                            <span style="color:#666; font-size:10px;">${formatTime(elapsedTime)}</span>
+                        </div>
+                    `);
                 }
             };
 
@@ -360,8 +415,7 @@
                 setIsActive(false); 
                 setIsPaused(false); 
                 
-                // SAVE RUN TO HISTORY
-                if (distance > 10) { // Only save if moved meaningful distance
+                if (distance > 10) { 
                     const newRun = {
                         id: Date.now(),
                         date: new Date().toLocaleDateString(),
@@ -373,8 +427,6 @@
                     const updatedHistory = [newRun, ...runHistory];
                     setRunHistory(updatedHistory);
                     localStorage.setItem('eduGeoTrack_history', JSON.stringify(updatedHistory));
-                    // Optional: Switch to history tab to show save? 
-                    // setActiveTab('history'); 
                 }
 
                 if (mapInstanceRef.current && polylineRef.current) {
@@ -395,6 +447,10 @@
                     polylineRef.current.remove();
                     polylineRef.current = null;
                 }
+                if (polylineInnerRef.current) {
+                    polylineInnerRef.current.remove();
+                    polylineInnerRef.current = null;
+                }
                 pauseMarkersRef.current.forEach(m => m.remove());
                 pauseMarkersRef.current = [];
             };
@@ -406,7 +462,6 @@
                 }
             };
 
-            // Smart display value for main stats
             const mainDistDisplay = formatDistance(distance);
 
             // --- UI RENDER ---
